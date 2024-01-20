@@ -28,6 +28,7 @@ impl<P> Message<P> {
 pub struct Body<P> {
     #[serde(rename = "msg_id")]
     pub id: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<usize>,
     #[serde(flatten)]
     pub payload: P,
@@ -55,11 +56,13 @@ pub trait Responder<P> {
     fn respond(&mut self, input_msg: Message<P>, output: &mut impl Write) -> anyhow::Result<()>;
 }
 
-pub fn write_out<P: Serialize>(msg: Message<P>, output: &mut impl Write) -> anyhow::Result<()> {
-    serde_json::to_writer(&mut *output, &msg).context("writing out response")?;
+pub fn write_out<P: Serialize>(msg: &Message<P>, output: &mut impl Write) -> anyhow::Result<()> {
+    serde_json::to_writer(&mut *output, msg).context("writing out response")?;
     output.write_all(b"\n").context("writing new line")?;
     Ok(())
 }
+
+
 
 pub fn run<P, R>() -> anyhow::Result<()>
 where
@@ -89,11 +92,12 @@ where
             payload: InitPayload::InitOk,
         },
     };
-    write_out(init_response, &mut stdout).context("responding to init")?;
+    write_out(&init_response, &mut stdout).context("responding to init")?;
     let mut responder: R = Responder::init(init_msg).context("create a responder")?;
 
     for line in input {
         let msg = line?;
+        // println!("---> {}", msg);
         let message: Message<P> =
             serde_json::from_str(&msg).context("deserializing next message")?;
         responder.respond(message, &mut stdout)?;

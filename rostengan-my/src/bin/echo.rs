@@ -13,12 +13,12 @@ enum EchoPayload {
 }
 
 struct EchoResponder {
-    id: usize,
+    msg_id: usize,
 }
 
 impl Responder<EchoPayload> for EchoResponder {
     fn init(_init_msg: InitMsg) -> anyhow::Result<Self> {
-        anyhow::Ok(EchoResponder { id: 0 })
+        anyhow::Ok(EchoResponder { msg_id: 1 })
     }
     fn respond(
         &mut self,
@@ -27,15 +27,15 @@ impl Responder<EchoPayload> for EchoResponder {
     ) -> anyhow::Result<()> {
 
         // `input_msg` will be moveed here (`into_reply` has `self`) and cannot be accessed after
-        let mut response = input_msg.into_reply(Some(self.id));
+        let mut response = input_msg.into_reply(Some(self.msg_id));
         match response.body.payload {
             EchoPayload::Echo { echo } => {
                 response.body.payload = EchoPayload::EchoOk { echo };
-                write_out(response, output).context("responding to init")?;
+                write_out(&response, output).context("responding to init")?;
             }
             _ => {}
         };
-        self.id += 1;
+        self.msg_id += 1;
         Ok(())
     }
 }

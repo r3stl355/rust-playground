@@ -1,4 +1,3 @@
-use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 
@@ -17,21 +16,27 @@ struct EchoResponder {
 }
 
 impl Responder<EchoPayload> for EchoResponder {
-    fn init(_init_msg: InitMsg) -> anyhow::Result<Self> {
+    fn init(
+        _init_msg: InitMsg,
+        _responder: std::sync::mpsc::Sender<MessageEvent<EchoPayload, ()>>,
+    ) -> anyhow::Result<Self> {
         anyhow::Ok(EchoResponder { msg_id: 1 })
     }
     fn respond(
         &mut self,
-        input_msg: Message<EchoPayload>,
+        event: MessageEvent<EchoPayload, ()>,
         output: &mut impl Write,
     ) -> anyhow::Result<()> {
+        let MessageEvent::External(msg) = event else {
+            panic!("Expected Echo payload message")
+        };
 
-        // `input_msg` will be moveed here (`into_reply` has `self`) and cannot be accessed after
-        let mut response = input_msg.into_reply(Some(self.msg_id));
+        // `msg` will be moveed here (`into_reply` has `self`) and cannot be accessed after
+        let mut response = msg.into_reply(Some(self.msg_id));
         match response.body.payload {
             EchoPayload::Echo { echo } => {
                 response.body.payload = EchoPayload::EchoOk { echo };
-                write_out(&response, output).context("responding to init")?;
+                response.send(output)?;
             }
             _ => {}
         };
@@ -41,5 +46,5 @@ impl Responder<EchoPayload> for EchoResponder {
 }
 
 fn main() -> anyhow::Result<()> {
-    run::<_, EchoResponder>()
+    run::<_, EchoResponder, _>()
 }

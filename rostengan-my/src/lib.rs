@@ -1,6 +1,7 @@
 use anyhow::Context;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::io::Write;
+use std::io::{BufRead, Write};
+use std::sync::mpsc::{self};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message<P> {
@@ -10,7 +11,10 @@ pub struct Message<P> {
     pub body: Body<P>,
 }
 
-impl<P> Message<P> {
+impl<P> Message<P>
+where
+    P: Serialize,
+{
     pub fn into_reply(self, msg_id: Option<usize>) -> Self {
         Self {
             src: self.dst,
@@ -19,8 +23,13 @@ impl<P> Message<P> {
                 id: msg_id,
                 in_reply_to: self.body.id,
                 payload: self.body.payload,
-            }
+            },
         }
+    }
+    pub fn send(self, output: &mut impl Write) -> anyhow::Result<()> {
+        serde_json::to_writer(&mut *output, &self).context("writing out response")?;
+        output.write_all(b"\n").context("writing new line")?;
+        Ok(())
     }
 }
 
@@ -42,6 +51,12 @@ enum InitPayload {
     InitOk,
 }
 
+pub enum MessageEvent<P, I> {
+    External(Message<P>),
+    Internal(I),
+    EOF,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct InitMsg {
@@ -49,31 +64,26 @@ pub struct InitMsg {
     pub node_ids: Vec<String>,
 }
 
-pub trait Responder<P> {
-    fn init(init_msg: InitMsg) -> anyhow::Result<Self>
+pub trait Responder<P, I = ()> {
+    fn init(init_msg: InitMsg, sender: mpsc::Sender<MessageEvent<P, I>>) -> anyhow::Result<Self>
     where
         Self: Sized;
-    fn respond(&mut self, input_msg: Message<P>, output: &mut impl Write) -> anyhow::Result<()>;
+    fn respond(&mut self, event: MessageEvent<P, I>, output: &mut impl Write)
+        -> anyhow::Result<()>;
 }
 
-pub fn write_out<P: Serialize>(msg: &Message<P>, output: &mut impl Write) -> anyhow::Result<()> {
-    serde_json::to_writer(&mut *output, msg).context("writing out response")?;
-    output.write_all(b"\n").context("writing new line")?;
-    Ok(())
-}
-
-
-
-pub fn run<P, R>() -> anyhow::Result<()>
+pub fn run<P, R, I>() -> anyhow::Result<()>
 where
     P: DeserializeOwned + Send + 'static,
-    R: Responder<P>,
+    R: Responder<P, I>,
+    I: Send + 'static,
 {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    let mut input = stdin.lines();
+    // Using `lock` will require `BufRead` to work
+    let stdin = std::io::stdin().lock();
+    let mut stdin = stdin.lines();
+    let mut stdout = std::io::stdout().lock();
 
-    let init_msg_str = &input
+    let init_msg_str = &stdin
         .next()
         .expect("no init message")
         .context("reading init message")?;
@@ -92,16 +102,32 @@ where
             payload: InitPayload::InitOk,
         },
     };
-    write_out(&init_response, &mut stdout).context("responding to init")?;
-    let mut responder: R = Responder::init(init_msg).context("create a responder")?;
+    init_response.send(&mut stdout)?;
 
-    for line in input {
-        let msg = line?;
-        // println!("---> {}", msg);
-        let message: Message<P> =
-            serde_json::from_str(&msg).context("deserializing next message")?;
-        responder.respond(message, &mut stdout)?;
+    let (sender, receiver) = mpsc::channel::<MessageEvent<P, I>>();
+    let mut responder: R =
+        Responder::init(init_msg, sender.clone()).context("create a responder")?;
+
+    drop(stdin);
+    let input_runnner = std::thread::spawn(move || {
+        let stdin = std::io::stdin().lock();
+        let stdin = stdin.lines();
+        for line in stdin {
+            let message: Message<P> = serde_json::from_str(&line.unwrap())
+                .context("deserializing next message")
+                .unwrap();
+            sender.send(MessageEvent::External(message)).unwrap();
+        }
+        sender.send(MessageEvent::EOF).unwrap();
+        Ok::<(), anyhow::Error>(())
+    });
+
+    for msg in receiver {
+        responder.respond(msg, &mut stdout)?;
     }
+    input_runnner
+        .join()
+        .expect("process to terminate gracefully")?;
 
     Ok(())
 }

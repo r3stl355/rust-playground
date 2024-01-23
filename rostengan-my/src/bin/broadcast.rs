@@ -24,15 +24,19 @@ enum BroadcastPayload {
     },
     Gossip {
         messages: HashSet<usize>,
+        also_sent_to: Vec<String>,
     },
+    GossipOk,
 }
 
 struct BroadcastResponder {
     node_id: String,
-    msg_id: usize,
+    next_msg_id: usize,
     neighbours: Vec<String>,
     messages: HashSet<usize>,
     stop_sender: mpsc::Sender<()>,
+    messages_to_gossip: HashMap<String, HashSet<usize>>,
+    gossip_sent: HashMap<usize, (String, HashSet<usize>)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,7 +51,7 @@ fn start_gossip(
     stop_channel: mpsc::Receiver<()>,
 ) {
     std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_micros(500));
+        std::thread::sleep(Duration::from_millis(100));
 
         // Exit the loop if signalled
         match stop_channel.try_recv() {
@@ -56,7 +60,6 @@ fn start_gossip(
             }
             Err(TryRecvError::Empty) => {}
         }
-
         sender
             .send(MessageEvent::Internal(InternalMessage::Gossip))
             .unwrap();
@@ -72,10 +75,12 @@ impl Responder<BroadcastPayload, InternalMessage> for BroadcastResponder {
         start_gossip(sender.clone(), stop_receiver);
         let responder = BroadcastResponder {
             node_id: init_msg.node_id,
-            msg_id: 1,
+            next_msg_id: 1,
             neighbours: vec![],
             messages: HashSet::new(),
-            stop_sender: stop_sender,
+            stop_sender,
+            messages_to_gossip: HashMap::new(),
+            gossip_sent: HashMap::new(),
         };
         anyhow::Ok(responder)
     }
@@ -89,25 +94,27 @@ impl Responder<BroadcastPayload, InternalMessage> for BroadcastResponder {
                 self.stop_sender.send(())?;
             }
             MessageEvent::Internal(InternalMessage::Gossip) => {
-                // Construct a set of broadcasts
-                for n in self.neighbours.clone() {
-                    let msg = Message {
+                for (n, msgs) in &self.messages_to_gossip {
+                    let message = Message {
                         src: self.node_id.clone(),
-                        dst: n,
+                        dst: n.clone(),
                         body: Body {
-                            id: Some(self.msg_id),
+                            id: Some(self.next_msg_id),
                             in_reply_to: None,
                             payload: BroadcastPayload::Gossip {
-                                messages: self.messages.clone(),
+                                messages: msgs.clone(),
+                                also_sent_to: self.neighbours.clone()
                             },
                         },
                     };
-                    msg.send(output)?;
-                    self.msg_id += 1;
+                    self.gossip_sent.insert(self.next_msg_id, (n.clone(), msgs.clone()));
+                    message.send(output)?;
+                    self.next_msg_id += 1;
                 }
             }
             MessageEvent::External(msg) => {
-                let mut response = msg.into_reply(Some(self.msg_id));
+                let in_reply_to = msg.body.in_reply_to;
+                let mut response = msg.into_reply(Some(self.next_msg_id));
                 match response.body.payload {
                     BroadcastPayload::Topology { topology } => {
                         self.neighbours = topology[&self.node_id].clone();
@@ -117,10 +124,12 @@ impl Responder<BroadcastPayload, InternalMessage> for BroadcastResponder {
                     BroadcastPayload::Broadcast { message } => {
                         if !self.messages.contains(&message) {
                             self.messages.insert(message);
-
-                            response.body.payload = BroadcastPayload::BroadcastOk;
-                            response.send(output)?;
+                            for n in self.neighbours.clone() {
+                                self.messages_to_gossip.entry(n.clone()).or_insert(HashSet::new()).insert(message);
+                            }
                         }
+                        response.body.payload = BroadcastPayload::BroadcastOk;
+                        response.send(output)?;
                     }
                     BroadcastPayload::Read => {
                         response.body.payload = BroadcastPayload::ReadOk {
@@ -128,12 +137,46 @@ impl Responder<BroadcastPayload, InternalMessage> for BroadcastResponder {
                         };
                         response.send(output)?;
                     }
-                    BroadcastPayload::Gossip { messages } => {
-                        self.messages.extend(messages);
+                    BroadcastPayload::Gossip { messages, also_sent_to} => {
+                        let new_msgs = messages.iter().filter_map(|m| if self.messages.contains(m) {None} else {Some(*m)}).collect::<HashSet<usize>>();
+                        if !new_msgs.is_empty() {
+
+                            // Insert not-seen messages to be gossiped to neighbours to which these messages were not already sent by the gossip originator
+                            self.messages.extend(new_msgs.clone());   
+                            let nodes_to_gossip: Vec<&String> = self.neighbours.iter().filter(|n| !also_sent_to.contains(n)).collect();
+                            // let nodes_to_gossip = self.neighbours.clone();
+                            for n in nodes_to_gossip {
+                                // Also ignore the gossip sender
+                                if n.clone() != response.dst {
+                                    self.messages_to_gossip.entry(n.clone()).or_insert(HashSet::new()).extend(new_msgs.clone());
+                                }
+                            }
+                        }
+                        response.body.payload = BroadcastPayload::GossipOk;
+                        response.send(output)?;
+                    }
+                    BroadcastPayload::GossipOk => {
+                        if let Some(msg_id) = in_reply_to {
+                            if let Some((node_id, confirmed)) = self.gossip_sent.get(&msg_id) {
+                                if let Some(messages) =
+                                    self.messages_to_gossip.get(node_id)
+                                {
+                                    self.messages_to_gossip.insert(
+                                        node_id.clone(),
+                                        messages
+                                            .clone()
+                                            .into_iter()
+                                            .filter(|m| !confirmed.contains(m))
+                                            .collect(),
+                                    );
+                                }
+                                self.gossip_sent.remove(&msg_id);
+                            }
+                        }
                     }
                     _ => {}
                 };
-                self.msg_id += 1;
+                self.next_msg_id += 1;
             }
         };
         Ok(())
